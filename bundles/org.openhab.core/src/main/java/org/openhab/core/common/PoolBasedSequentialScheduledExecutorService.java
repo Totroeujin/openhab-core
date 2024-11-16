@@ -167,6 +167,7 @@ final class PoolBasedSequentialScheduledExecutorService implements ScheduledExec
 
     @Override
     public ScheduledFuture<?> schedule(@Nullable Runnable command, long delay, @Nullable TimeUnit unit) {
+        validateCommand(command); // Ensure command not null for error handling
         return schedule((origin) -> pool.schedule(() -> {
             // we might block the thread here, in worst case new threads are spawned
             submitToWorkQueue(origin.join(), command, true).join();
@@ -175,6 +176,7 @@ final class PoolBasedSequentialScheduledExecutorService implements ScheduledExec
 
     @Override
     public <V> ScheduledFuture<V> schedule(@Nullable Callable<V> callable, long delay, @Nullable TimeUnit unit) {
+        validateCommand(callable); // Ensure callable not null
         return schedule((origin) -> pool.schedule(() -> {
             // we might block the thread here, in worst case new threads are spawned
             return submitToWorkQueue(origin.join(), callable, true).join();
@@ -184,45 +186,48 @@ final class PoolBasedSequentialScheduledExecutorService implements ScheduledExec
     @Override
     public ScheduledFuture<?> scheduleAtFixedRate(@Nullable Runnable command, long initialDelay, long period,
             @Nullable TimeUnit unit) {
-        return schedule((origin) -> pool.scheduleAtFixedRate(() -> {
-            CompletableFuture<?> submitted;
+                validateCommand(command);
+                return schedule((origin) -> pool.scheduleAtFixedRate(() -> {
+                    CompletableFuture<?> submitted;
 
-            try {
-                submitted = submitToWorkQueue(origin.join(), command, true);
-            } catch (RejectedExecutionException ex) {
-                // the pool has been shutdown, scheduled tasks should cancel
-                return;
-            }
+                    try {
+                        submitted = submitToWorkQueue(origin.join(), command, true);
+                    } catch (RejectedExecutionException ex) {
+                        // the pool has been shutdown, scheduled tasks should cancel
+                        return;
+                    }
 
-            // we might block the thread here, in worst case new threads are spawned
-            submitted.join();
-        }, initialDelay, period, unit));
+                    // we might block the thread here, in worst case new threads are spawned
+                    submitted.join();
+                }, initialDelay, period, unit));
     }
 
     @Override
     public ScheduledFuture<?> scheduleWithFixedDelay(@Nullable Runnable command, long initialDelay, long delay,
             @Nullable TimeUnit unit) {
-        return schedule((origin) -> pool.scheduleWithFixedDelay(() -> {
-            CompletableFuture<?> submitted;
+                validateCommand(command);
+                return schedule((origin) -> pool.scheduleWithFixedDelay(() -> {
+                    CompletableFuture<?> submitted;
 
-            try {
-                submitted = submitToWorkQueue(origin.join(), command, true);
-            } catch (RejectedExecutionException ex) {
-                // the pool has been shutdown, scheduled tasks should cancel
-                return;
-            }
+                    try {
+                        submitted = submitToWorkQueue(origin.join(), command, true);
+                    } catch (RejectedExecutionException ex) {
+                        // the pool has been shutdown, scheduled tasks should cancel
+                        return;
+                    }
 
-            // we might block the thread here, in worst case new threads are spawned
-            submitted.join();
-        }, initialDelay, delay, unit));
+                    // we might block the thread here, in worst case new threads are spawned
+                    submitted.join();
+                }, initialDelay, delay, unit));
     }
 
+
     private <V> ScheduledFuture<V> schedule(
-            Function<CompletableFuture<RunnableFuture<?>>, ScheduledFuture<V>> doSchedule) {
-        synchronized (this) {
-            if (tail == null) {
-                throw new RejectedExecutionException("this scheduled executor has been shutdown before");
-            }
+        Function<CompletableFuture<RunnableFuture<?>>, ScheduledFuture<V>> doSchedule) {
+            synchronized (this) {
+                if (tail == null) {
+                    throw new RejectedExecutionException("this scheduled executor has been shutdown before");
+                }
 
             CompletableFuture<RunnableFuture<?>> origin = new CompletableFuture<>();
             ScheduledFuture<V> future = doSchedule.apply(origin);
@@ -231,21 +236,16 @@ final class PoolBasedSequentialScheduledExecutorService implements ScheduledExec
             origin.complete((RunnableFuture<?>) future);
 
             return future;
+            }
         }
-    }
 
     @Override
     public void shutdown() {
         synchronized (this) {
-            if (tail == null) {
-                return;
-            }
-
+            if (tail == null) {return;}
             cleaner.cancel(false);
-            scheduled.removeIf((sf) -> {
-                sf.cancel(false);
-                return true;
-            });
+            scheduled.forEach(sf -> sf.cancel(false)); 
+            scheduled.clear();
             tail = null;
         }
     }
@@ -254,39 +254,37 @@ final class PoolBasedSequentialScheduledExecutorService implements ScheduledExec
     @NonNullByDefault({})
     public List<Runnable> shutdownNow() {
         synchronized (this) {
-            if (tail == null) {
-                return List.of();
-            }
+            if (tail == null) {return List.of();}
 
             // ensures we do not leak the internal cleaner as Runnable
             cleaner.cancel(false);
 
+            // Collect all pending tasks
             Set<@Nullable Runnable> runnables = Collections.newSetFromMap(new IdentityHashMap<>());
-            WorkQueueEntry entry = tail;
-            scheduled.removeIf((sf) -> {
-                if (sf.cancel(false)) {
-                    runnables.add(sf);
-                }
-                return true;
-            });
+            cleanupScheduledTasks(runnables);
             tail = null;
 
-            while (entry != null) {
-                if (!entry.future.cancel(false)) {
-                    break;
-                }
-
-                if (entry.origin != null) {
-                    // entry has been submitted by a .schedule call
-                    runnables.add(entry.origin);
-                } else {
-                    // entry has been submitted by a .submit call
-                    runnables.add(entry.future);
-                }
-                entry = entry.prev;
-            }
-
             return List.copyOf(runnables);
+        }
+    }
+
+    private void cleanupScheduledTasks(Set<Runnable> runnables){
+        WorkQueueEntry entry = tail;
+
+        // Cancel all scheduled tasks
+        scheduled.forEach(sf -> {
+            if(sf.cancel(false)) {runnables.add(sf);}
+        });
+
+        // Traverse the queue and cancel any remaining tasks
+        while (entry != null){
+            if(!entry.future.cancel(false)) break;
+            if(entry.origin != null){
+                runnables.add(entry.origin);
+            }else{
+                runnables.add(entry.future);
+            }
+            entry = entry.prev;
         }
     }
 
@@ -520,8 +518,15 @@ final class PoolBasedSequentialScheduledExecutorService implements ScheduledExec
         throw new TimeoutException("none of the tasks did complete in time");
     }
 
+    private void validateCommand(Object command){
+        if (command == null){
+            throw new IllegalArgumentException("Command cannot be null");
+        }
+    }
+
     @Override
     public void execute(Runnable command) {
+        validateCommand(command); // Ensure command is valid when executing concurrently to prevent waste of resources
         submit(command);
     }
 
