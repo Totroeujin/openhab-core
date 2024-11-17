@@ -273,6 +273,7 @@ public abstract class AbstractStorageBasedTypeProvider
         entity.step = fragment.getStep();
         entity.options = fragment.getOptions();
         entity.pattern = fragment.getPattern();
+        entity.rangeUnit = fragment.getRangeUnit();
         entity.isReadOnly = fragment.isReadOnly();
         return entity;
     }
@@ -377,6 +378,9 @@ public abstract class AbstractStorageBasedTypeProvider
         if (entity.pattern != null) {
             builder.withPattern(Objects.requireNonNull(entity.pattern));
         }
+        if (entity.rangeUnit != null) {
+            builder.withPattern(Objects.requireNonNull(entity.rangeUnit));
+        }
         builder.withReadOnly(entity.isReadOnly);
         return builder.build();
     }
@@ -446,6 +450,7 @@ public abstract class AbstractStorageBasedTypeProvider
         public @Nullable BigDecimal step;
         public @Nullable List<StateOption> options;
         public @Nullable String pattern;
+        public @Nullable String rangeUnit;
         public boolean isReadOnly = false;
     }
 }
