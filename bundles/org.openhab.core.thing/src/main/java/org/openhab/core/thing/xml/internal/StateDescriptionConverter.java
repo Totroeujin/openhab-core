@@ -128,6 +128,11 @@ public class StateDescriptionConverter extends GenericUnmarshaller<StateDescript
             builder.withPattern(pattern);
         }
 
+        String rangeUnit = attributes.get("rangeUnit");
+        if (rangeUnit != null) {
+            builder.withRangeUnit(rangeUnit);
+        }
+
         NodeList nodes = (NodeList) context.convertAnother(context, NodeList.class);
         NodeIterator nodeIterator = new NodeIterator(nodes.getList());
 

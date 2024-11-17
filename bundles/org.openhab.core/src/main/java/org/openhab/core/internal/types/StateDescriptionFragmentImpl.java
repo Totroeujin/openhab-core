@@ -34,7 +34,8 @@ public class StateDescriptionFragmentImpl implements StateDescriptionFragment {
 
     private static class StateDescriptionImpl extends StateDescription {
         StateDescriptionImpl(@Nullable BigDecimal minimum, @Nullable BigDecimal maximum, @Nullable BigDecimal step,
-                @Nullable String pattern, @Nullable String rangeUnit, boolean readOnly, @Nullable List<StateOption> options) {
+                @Nullable String pattern, @Nullable String rangeUnit, boolean readOnly,
+                @Nullable List<StateOption> options) {
             super(minimum, maximum, step, pattern, rangeUnit, readOnly, options);
         }
     }
@@ -179,12 +180,13 @@ public class StateDescriptionFragmentImpl implements StateDescriptionFragment {
 
     @Override
     public @Nullable StateDescription toStateDescription() {
-        if (minimum == null && maximum == null && step == null && readOnly == null && pattern == null && rangeUnit == null
-                && options == null) {
+        if (minimum == null && maximum == null && step == null && readOnly == null && pattern == null
+                && rangeUnit == null && options == null) {
             return null;
         }
         final Boolean ro = readOnly;
-        return new StateDescriptionImpl(minimum, maximum, step, pattern, rangeUnit, ro != null && ro.booleanValue(), options);
+        return new StateDescriptionImpl(minimum, maximum, step, pattern, rangeUnit, ro != null && ro.booleanValue(),
+                options);
     }
 
     /**
@@ -247,13 +249,14 @@ public class StateDescriptionFragmentImpl implements StateDescriptionFragment {
         StateDescriptionFragmentImpl other = (StateDescriptionFragmentImpl) obj;
         return Objects.equals(minimum, other.minimum) && Objects.equals(maximum, other.maximum)
                 && Objects.equals(step, other.step) && Objects.equals(pattern, other.pattern)
-                && Objects.equals(rangeUnit, other.rangeUnit)
-                && Objects.equals(readOnly, other.readOnly) && Objects.equals(options, other.options);
+                && Objects.equals(rangeUnit, other.rangeUnit) && Objects.equals(readOnly, other.readOnly)
+                && Objects.equals(options, other.options);
     }
 
     @Override
     public String toString() {
         return "StateDescription [minimum=" + minimum + ", maximum=" + maximum + ", step=" + step + ", pattern="
-                + pattern + ", rangeUnit=" + rangeUnit + ", readOnly=" + readOnly + ", channelStateOptions=" + options + "]";
+                + pattern + ", rangeUnit=" + rangeUnit + ", readOnly=" + readOnly + ", channelStateOptions=" + options
+                + "]";
     }
 }

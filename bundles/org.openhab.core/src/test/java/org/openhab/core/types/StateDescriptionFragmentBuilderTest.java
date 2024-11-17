@@ -87,8 +87,8 @@ public class StateDescriptionFragmentBuilderTest {
 
     @Test
     public void builderWithStateDescription() {
-        StateDescription source = new StateDescription(BigDecimal.ZERO, BigDecimal.TEN, BigDecimal.ONE, "pattern", "rangeUnit", true,
-                List.of(new StateOption("value", "label")));
+        StateDescription source = new StateDescription(BigDecimal.ZERO, BigDecimal.TEN, BigDecimal.ONE, "pattern",
+                "rangeUnit", true, List.of(new StateOption("value", "label")));
         StateDescriptionFragmentBuilder builder = StateDescriptionFragmentBuilder.create(source);
         StateDescriptionFragment fragment = builder.build();
 
@@ -109,8 +109,8 @@ public class StateDescriptionFragmentBuilderTest {
                 .withStep(BigDecimal.ONE).withPattern("pattern").withRangeUnit("rangeUnit").withReadOnly(Boolean.FALSE)
                 .withOptions(List.of(new StateOption("value", "label"))).build();
         StateDescriptionFragment fragment2 = builder.withMinimum(BigDecimal.ONE).withMaximum(BigDecimal.ONE)
-                .withStep(BigDecimal.ZERO).withPattern("pattern_new").withRangeUnit("rangeUnit_new").withReadOnly(Boolean.TRUE).withOptions(List.of())
-                .build();
+                .withStep(BigDecimal.ZERO).withPattern("pattern_new").withRangeUnit("rangeUnit_new")
+                .withReadOnly(Boolean.TRUE).withOptions(List.of()).build();
 
         assertThat(fragment1.getMinimum(), is(not(fragment2.getMinimum())));
         assertThat(fragment1.getMaximum(), is(not(fragment2.getMaximum())));
