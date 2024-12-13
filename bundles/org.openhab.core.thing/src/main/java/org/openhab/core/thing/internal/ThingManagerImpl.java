@@ -20,6 +20,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Map.Entry;
 import java.util.Objects;
+import java.util.Optional;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CopyOnWriteArrayList;
@@ -28,7 +29,6 @@ import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.locks.Lock;
 import java.util.concurrent.locks.ReentrantLock;
-
 import org.eclipse.jdt.annotation.NonNullByDefault;
 import org.eclipse.jdt.annotation.Nullable;
 import org.openhab.core.common.SafeCaller;
@@ -245,14 +245,27 @@ public class ThingManagerImpl implements ReadyTracker, ThingManager, ThingTracke
                     "Provider for thing {0} cannot be determined because it is not known to the registry",
                     thing.getUID().getAsString()));
         }
-        if (provider instanceof ManagedProvider<Thing, ThingUID> managedProvider) {
-            managedProvider.update(thing);
+
+        // Use helper method to safely cast and handle ManagedProvider
+        Optional<ManagedProvider<Thing, ThingUID>> managedProviderOpt = asManagedProvider(provider);
+        if (managedProviderOpt.isPresent()) {
+            // Call update on ManagedProvider if the cast succeeds
+            managedProviderOpt.get().update(thing);
         } else {
+            // Handle the provider as a generic Provider if it is not a ManagedProvider
             logger.debug("Only updating thing {} in the registry because provider {} is not managed.",
-                    thing.getUID().getAsString(), provider);
+                thing.getUID().getAsString(), provider);
             thingRegistry.updated(provider, oldThing, thing);
         }
         thingUpdatedLock.remove(thing.getUID());
+    }
+
+    private Optional<ManagedProvider<Thing, ThingUID>> asManagedProvider(Provider<Thing> provider) {
+        if (provider instanceof ManagedProvider<?, ?>) {
+            // Safe cast to ManagedProvider<Thing, ThingUID>
+            return Optional.of((ManagedProvider<Thing, ThingUID>) provider);
+        }
+        return Optional.empty();
     }
 
     @Override
