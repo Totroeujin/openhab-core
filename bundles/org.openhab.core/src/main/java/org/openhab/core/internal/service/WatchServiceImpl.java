@@ -16,33 +16,21 @@ import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.NoSuchFileException;
 import java.nio.file.Path;
-import java.util.Dictionary;
-import java.util.HashMap;
-import java.util.Hashtable;
-import java.util.List;
-import java.util.Map;
-import java.util.Objects;
-import java.util.concurrent.CompletableFuture;
-import java.util.concurrent.ConcurrentHashMap;
-import java.util.concurrent.CopyOnWriteArrayList;
-import java.util.concurrent.ExecutorService;
-import java.util.concurrent.Executors;
-import java.util.concurrent.ScheduledExecutorService;
-import java.util.concurrent.ScheduledFuture;
-import java.util.concurrent.TimeUnit;
+import java.util.*;
+import java.util.concurrent.*;
+import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.Predicate;
+import java.util.stream.Collectors;
 
+import com.google.common.cache.Cache;
+import com.google.common.cache.CacheBuilder;
 import org.eclipse.jdt.annotation.NonNullByDefault;
 import org.eclipse.jdt.annotation.Nullable;
 import org.openhab.core.common.ThreadPoolManager;
 import org.openhab.core.service.WatchService;
 import org.osgi.framework.BundleContext;
 import org.osgi.framework.ServiceRegistration;
-import org.osgi.service.component.annotations.Activate;
-import org.osgi.service.component.annotations.Component;
-import org.osgi.service.component.annotations.ConfigurationPolicy;
-import org.osgi.service.component.annotations.Deactivate;
-import org.osgi.service.component.annotations.Modified;
+import org.osgi.service.component.annotations.*;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -51,40 +39,38 @@ import io.methvin.watcher.DirectoryChangeListener;
 import io.methvin.watcher.DirectoryWatcher;
 import io.methvin.watcher.hashing.FileHash;
 
-/**
- * The {@link WatchServiceImpl} is the implementation of the {@link WatchService}
- *
- * @author Jan N. Klug - Initial contribution
- */
 @NonNullByDefault
 @Component(immediate = true, service = WatchService.class, configurationPid = WatchService.SERVICE_PID, configurationPolicy = ConfigurationPolicy.REQUIRE)
 public class WatchServiceImpl implements WatchService, DirectoryChangeListener {
 
-    public static final int PROCESSING_TIME = 1000;
+    private static final int EVENT_BATCH_SIZE = 100;
+    private static final int EVENT_QUEUE_SIZE = 10000;
+    private static final int HASH_CACHE_MAX_SIZE = 10000;
+    private static final long BATCH_PROCESSING_INTERVAL = 1000;
+    private static final long BATCH_WINDOW_MS = 100;
+    private static final int MAX_RETRY_ATTEMPTS = 3;
+    private static final int SHUTDOWN_TIMEOUT_SECONDS = 10;
+    private static final long HASH_CACHE_EXPIRY_HOURS = 24;
 
     public @interface WatchServiceConfiguration {
         String name() default "";
-
         String path() default "";
     }
 
     private final Logger logger = LoggerFactory.getLogger(WatchServiceImpl.class);
-
+    private final BlockingQueue<DirectoryChangeEvent> eventQueue = new ArrayBlockingQueue<>(EVENT_QUEUE_SIZE);
     private final List<Listener> dirPathListeners = new CopyOnWriteArrayList<>();
     private final List<Listener> subDirPathListeners = new CopyOnWriteArrayList<>();
-    private final Map<Path, FileHash> hashCache = new ConcurrentHashMap<>();
     private final ExecutorService executor;
     private final ScheduledExecutorService scheduler;
-
     private final String name;
     private final BundleContext bundleContext;
+    private final AtomicReference<Path> basePath = new AtomicReference<>();
+    private final Cache<Path, FileHash> hashCache;
 
-    private @Nullable Path basePath;
     private @Nullable DirectoryWatcher dirWatcher;
     private @Nullable ServiceRegistration<WatchService> reg;
-
-    private final Map<Path, ScheduledFuture<?>> scheduledEvents = new HashMap<>();
-    private final Map<Path, List<DirectoryChangeEvent>> scheduledEventKinds = new ConcurrentHashMap<>();
+    private @Nullable ScheduledFuture<?> batchProcessingTask;
 
     @Activate
     public WatchServiceImpl(WatchServiceConfiguration config, BundleContext bundleContext) throws IOException {
@@ -93,68 +79,112 @@ public class WatchServiceImpl implements WatchService, DirectoryChangeListener {
             throw new IllegalArgumentException("service name must not be blank");
         }
 
+        this.hashCache = CacheBuilder.newBuilder()
+            .maximumSize(HASH_CACHE_MAX_SIZE)
+            .expireAfterAccess(HASH_CACHE_EXPIRY_HOURS, TimeUnit.HOURS)
+            .recordStats()
+            .build();
+
         this.name = config.name();
-        executor = Executors.newSingleThreadExecutor(r -> new Thread(r, name));
+        executor = new ThreadPoolExecutor(1, 1, 0L, TimeUnit.MILLISECONDS,
+            new ArrayBlockingQueue<>(1000),
+            r -> new Thread(r, name + "-executor"),
+            new ThreadPoolExecutor.CallerRunsPolicy());
+
         scheduler = ThreadPoolManager.getScheduledPool("watchservice");
         modified(config);
+        
+        batchProcessingTask = scheduler.scheduleWithFixedDelay(
+            this::processBatchEvents,
+            BATCH_PROCESSING_INTERVAL,
+            BATCH_PROCESSING_INTERVAL,
+            TimeUnit.MILLISECONDS
+        );
     }
 
     @Modified
     public void modified(WatchServiceConfiguration config) throws IOException {
         logger.trace("Trying to setup WatchService '{}' with path '{}'", config.name(), config.path());
+        Path newBasePath = Path.of(config.path()).toAbsolutePath();
+        Path currentBasePath = basePath.get();
 
-        Path basePath = Path.of(config.path()).toAbsolutePath();
-
-        if (basePath.equals(this.basePath)) {
+        if (newBasePath.equals(currentBasePath)) {
             return;
         }
 
-        this.basePath = basePath;
-
         try {
             closeWatcherAndUnregister();
+            ensureDirectoryExists(newBasePath);
+            basePath.set(newBasePath);
 
-            if (!Files.exists(basePath)) {
-                logger.info("Watch directory '{}' does not exist. Trying to create it.", basePath);
-                Files.createDirectories(basePath);
-            }
+            DirectoryWatcher newDirWatcher = DirectoryWatcher.builder()
+                .listener(this)
+                .path(newBasePath)
+                .build();
 
-            DirectoryWatcher newDirWatcher = DirectoryWatcher.builder().listener(this).path(basePath).build();
             CompletableFuture
-                    .runAsync(
-                            () -> newDirWatcher.watchAsync(executor)
-                                    .thenRun(() -> logger.debug("WatchService '{}' has been shut down.", name)),
-                            ThreadPoolManager.getScheduledPool(ThreadPoolManager.THREAD_POOL_NAME_COMMON))
-                    .thenRun(this::registerWatchService);
+                .runAsync(
+                    () -> newDirWatcher.watchAsync(executor)
+                        .thenRun(() -> logger.debug("WatchService '{}' has been shut down.", name)),
+                    ThreadPoolManager.getScheduledPool(ThreadPoolManager.THREAD_POOL_NAME_COMMON))
+                .thenRun(this::registerWatchService);
+
             this.dirWatcher = newDirWatcher;
+
         } catch (NoSuchFileException e) {
-            // log message here, otherwise it'll be swallowed by the call to newInstance in the factory
-            // also re-throw the exception to indicate that we failed
             logger.warn("Could not instantiate WatchService '{}', directory '{}' is missing.", name, e.getMessage());
             throw e;
         } catch (IOException e) {
-            // log message here, otherwise it'll be swallowed by the call to newInstance in the factory
-            // also re-throw the exception to indicate that we failed
             logger.warn("Could not instantiate WatchService '{}':", name, e);
             throw e;
+        }
+    }
+
+    private void ensureDirectoryExists(Path path) throws IOException {
+        int attempts = 0;
+        while (attempts < MAX_RETRY_ATTEMPTS) {
+            try {
+                if (!Files.exists(path)) {
+                    Files.createDirectories(path);
+                }
+                return;
+            } catch (IOException e) {
+                attempts++;
+                if (attempts == MAX_RETRY_ATTEMPTS) {
+                    throw e;
+                }
+                try {
+                    Thread.sleep(1000);
+                } catch (InterruptedException ie) {
+                    Thread.currentThread().interrupt();
+                    throw new IOException("Directory creation interrupted", ie);
+                }
+            }
         }
     }
 
     @Deactivate
     public void deactivate() {
         try {
+            if (batchProcessingTask != null) {
+                batchProcessingTask.cancel(false);
+            }
+
             closeWatcherAndUnregister();
+            
             executor.shutdown();
-        } catch (IOException e) {
+            if (!executor.awaitTermination(SHUTDOWN_TIMEOUT_SECONDS, TimeUnit.SECONDS)) {
+                executor.shutdownNow();
+            }
+            
+            scheduler.shutdown();
+            if (!scheduler.awaitTermination(SHUTDOWN_TIMEOUT_SECONDS, TimeUnit.SECONDS)) {
+                scheduler.shutdownNow();
+            }
+        } catch (IOException | InterruptedException e) {
+            Thread.currentThread().interrupt();
             logger.warn("Failed to shutdown WatchService '{}'", name, e);
         }
-    }
-
-    private void registerWatchService() {
-        Dictionary<String, Object> properties = new Hashtable<>();
-        properties.put(WatchService.SERVICE_PROPERTY_NAME, name);
-        this.reg = bundleContext.registerService(WatchService.class, this, properties);
-        logger.debug("WatchService '{}' completed initialization and registered itself as service.", name);
     }
 
     private void closeWatcherAndUnregister() throws IOException {
@@ -174,35 +204,44 @@ public class WatchServiceImpl implements WatchService, DirectoryChangeListener {
             this.reg = null;
         }
 
-        hashCache.clear();
+        hashCache.invalidateAll();
+        eventQueue.clear();
+    }
+
+    private void registerWatchService() {
+        Dictionary<String, Object> properties = new Hashtable<>();
+        properties.put(WatchService.SERVICE_PROPERTY_NAME, name);
+        this.reg = bundleContext.registerService(WatchService.class, this, properties);
+        logger.debug("WatchService '{}' completed initialization and registered itself as service.", name);
     }
 
     @Override
     public Path getWatchPath() {
-        Path basePath = this.basePath;
-        if (basePath == null) {
+        Path path = basePath.get();
+        if (path == null) {
             throw new IllegalStateException("Trying to access WatchService before initialization completed.");
         }
-        return basePath;
+        return path;
     }
 
     @Override
     public void registerListener(WatchEventListener watchEventListener, List<Path> paths, boolean withSubDirectories) {
-        Path basePath = this.basePath;
-        if (basePath == null) {
+        Path path = basePath.get();
+        if (path == null) {
             throw new IllegalStateException("Trying to register listener before initialization completed.");
         }
-        for (Path path : paths) {
-            Path absolutePath = path.isAbsolute() ? path : basePath.resolve(path).toAbsolutePath();
-            if (absolutePath.startsWith(basePath)) {
+        
+        for (Path listenerPath : paths) {
+            Path absolutePath = listenerPath.isAbsolute() ? listenerPath : path.resolve(listenerPath).toAbsolutePath();
+            if (absolutePath.startsWith(path)) {
                 if (withSubDirectories) {
                     subDirPathListeners.add(new Listener(absolutePath, watchEventListener));
                 } else {
                     dirPathListeners.add(new Listener(absolutePath, watchEventListener));
                 }
             } else {
-                logger.warn("Tried to add path '{}' to listener '{}', but the base path of this listener is '{}'", path,
-                        name, basePath);
+                logger.warn("Tried to add path '{}' to listener '{}', but the base path of this listener is '{}'",
+                    listenerPath, name, path);
             }
         }
     }
@@ -213,64 +252,86 @@ public class WatchServiceImpl implements WatchService, DirectoryChangeListener {
         dirPathListeners.removeIf(Listener.isListener(watchEventListener));
     }
 
-    @Override
-    public void onEvent(@Nullable DirectoryChangeEvent directoryChangeEvent) throws IOException {
-        logger.trace("onEvent {}", directoryChangeEvent);
-        if (directoryChangeEvent == null || directoryChangeEvent.isDirectory()
-                || directoryChangeEvent.eventType() == DirectoryChangeEvent.EventType.OVERFLOW) {
-            // exit early, we are neither interested in directory events nor in OVERFLOW events
-            return;
-        }
+    private void processBatchEvents() {
+        try {
+            List<DirectoryChangeEvent> batch = new ArrayList<>(EVENT_BATCH_SIZE);
+            DirectoryChangeEvent event;
+            long deadline = System.currentTimeMillis() + BATCH_WINDOW_MS;
 
-        Path path = directoryChangeEvent.path();
-
-        synchronized (scheduledEvents) {
-            ScheduledFuture<?> future = scheduledEvents.remove(path);
-            if (future != null && !future.isDone()) {
-                future.cancel(true);
+            while (System.currentTimeMillis() < deadline && batch.size() < EVENT_BATCH_SIZE) {
+                event = eventQueue.poll();
+                if (event == null) break;
+                batch.add(event);
             }
-            future = scheduler.schedule(() -> notifyListeners(path), PROCESSING_TIME, TimeUnit.MILLISECONDS);
-            scheduledEventKinds.computeIfAbsent(path, k -> new CopyOnWriteArrayList<>()).add(directoryChangeEvent);
-            scheduledEvents.put(path, future);
+
+            if (batch.isEmpty()) {
+                return;
+            }
+
+            Map<Path, List<DirectoryChangeEvent>> eventsByPath = batch.stream()
+                .collect(Collectors.groupingBy(DirectoryChangeEvent::path,
+                    Collectors.collectingAndThen(
+                        Collectors.toList(),
+                        list -> {
+                            list.sort(Comparator.comparing(DirectoryChangeEvent::timestamp));
+                            return list;
+                        }
+                    )));
+
+            for (Map.Entry<Path, List<DirectoryChangeEvent>> entry : eventsByPath.entrySet()) {
+                Path path = entry.getKey();
+                List<DirectoryChangeEvent> events = entry.getValue();
+                processEventsForPath(path, events);
+            }
+        } catch (Exception e) {
+            logger.error("Error processing batch events", e);
         }
     }
 
-    private void notifyListeners(Path path) {
-        List<DirectoryChangeEvent> events = scheduledEventKinds.remove(path);
-        if (events == null || events.isEmpty()) {
-            logger.debug("Tried to notify listeners of change events for '{}', but the event list is empty.", path);
+    private void processEventsForPath(Path path, List<DirectoryChangeEvent> events) {
+        DirectoryChangeEvent firstEvent = events.get(0);
+        DirectoryChangeEvent lastEvent = events.get(events.size() - 1);
+
+        if (lastEvent.eventType() == DirectoryChangeEvent.EventType.DELETE) {
+            if (firstEvent.eventType() != DirectoryChangeEvent.EventType.CREATE) {
+                hashCache.invalidate(path);
+                doNotify(path, Kind.DELETE);
+            } else {
+                logger.debug("Discarding events for '{}' as file was deleted right after creation", path);
+            }
+        } else {
+            FileHash newHash = lastEvent.hash();
+            if (newHash != null) {
+                FileHash oldHash = hashCache.asMap().put(path, newHash);
+                if (!Objects.equals(oldHash, newHash)) {
+                    Kind kind = firstEvent.eventType() == DirectoryChangeEvent.EventType.CREATE 
+                        ? Kind.CREATE : Kind.MODIFY;
+                    doNotify(path, kind);
+                }
+            } else {
+                logger.warn("Received event without hash for {}", path);
+            }
+        }
+    }
+
+    @Override
+    public void onEvent(@Nullable DirectoryChangeEvent event) throws IOException {
+        if (event == null || event.isDirectory() || 
+            event.eventType() == DirectoryChangeEvent.EventType.OVERFLOW ||
+            isTempFile(event.path())) {
             return;
         }
 
-        DirectoryChangeEvent firstElement = events.get(0);
-        DirectoryChangeEvent lastElement = events.get(events.size() - 1);
-
-        // determine final event
-        if (lastElement.eventType() == DirectoryChangeEvent.EventType.DELETE) {
-            if (firstElement.eventType() == DirectoryChangeEvent.EventType.CREATE) {
-                logger.debug("Discarding events for '{}' because file was immediately deleted after creation", path);
-                return;
-            }
-            hashCache.remove(lastElement.path());
-            doNotify(path, Kind.DELETE);
-        } else if (firstElement.eventType() == DirectoryChangeEvent.EventType.CREATE) {
-            if (lastElement.hash() == null) {
-                logger.warn("Detected invalid event (hash must not be null for CREATE/MODIFY): {}", lastElement);
-                return;
-            }
-            hashCache.put(lastElement.path(), lastElement.hash());
-            doNotify(path, Kind.CREATE);
-        } else {
-            if (lastElement.hash() == null) {
-                logger.warn("Detected invalid event (hash must not be null for CREATE/MODIFY): {}", lastElement);
-                return;
-            }
-            FileHash oldHash = hashCache.put(lastElement.path(), lastElement.hash());
-            if (!Objects.equals(oldHash, lastElement.hash())) {
-                // only notify if hashes are different, otherwise the file content did not chnge
-                doNotify(path, Kind.MODIFY);
-            }
+        if (!eventQueue.offer(event)) {
+            logger.warn("Event queue full, dropping event for {}", event.path());
         }
+    }
+
+    private boolean isTempFile(Path path) {
+        String fileName = path.getFileName().toString();
+        return fileName.startsWith(".") || 
+               fileName.endsWith(".tmp") ||
+               fileName.endsWith(".swp");
     }
 
     private void doNotify(Path path, Kind kind) {
@@ -288,7 +349,6 @@ public class WatchServiceImpl implements WatchService, DirectoryChangeListener {
     }
 
     private record Listener(Path rootPath, WatchEventListener watchEventListener) {
-
         void notify(Path path, Kind kind) {
             watchEventListener.processWatchEvent(kind, rootPath.relativize(path));
         }
